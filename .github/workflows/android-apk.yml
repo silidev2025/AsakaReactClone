@@ -1,0 +1,148 @@
+name: Android APK
+
+# Wraps the built site in a Capacitor Android shell and publishes the APK to
+# the "android-latest" GitHub release. The web files are bundled inside the
+# APK, so the app opens without a server or tunnel.
+#
+# Direct download link (always the newest build):
+# https://github.com/silidev2025/asaka/releases/download/android-latest/AsaKa.apk
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: true
+
+env:
+  APP_ID: com.silidev2025.asaka
+  APP_NAME: AsaKa
+  CAPACITOR_VERSION: 8.5.3
+  THEME_COLOR: "#a30e00"
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22.x"
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # The runner image ships with the Android SDK; just make sure its
+      # licenses are accepted so Gradle can fetch any missing platform.
+      - name: Accept Android SDK licenses
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1 || true)
+          if [ -n "$SDKMANAGER" ]; then
+            yes | "$SDKMANAGER" --licenses > /dev/null || true
+          fi
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build site
+        run: bun run build
+
+      - name: Add Capacitor Android project
+        run: |
+          bun add -d \
+            @capacitor/cli@$CAPACITOR_VERSION \
+            @capacitor/core@$CAPACITOR_VERSION \
+            @capacitor/android@$CAPACITOR_VERSION
+          cat > capacitor.config.json <<EOF
+          {
+            "appId": "$APP_ID",
+            "appName": "$APP_NAME",
+            "webDir": "dist"
+          }
+          EOF
+          npx cap add android
+
+      - name: Customize Android project
+        run: |
+          RES=android/app/src/main/res
+
+          # App icon: use the PWA icon instead of the Capacitor logo.
+          for dir in $RES/mipmap-*dpi; do
+            cp public/pwa-512x512.png "$dir/ic_launcher.png"
+            cp public/pwa-512x512.png "$dir/ic_launcher_round.png"
+            cp public/pwa-512x512.png "$dir/ic_launcher_foreground.png"
+          done
+          rm -rf $RES/mipmap-anydpi-v26
+
+          # Launch screen: brand color with the app icon, not the Capacitor splash.
+          sed -i "s|<item name=\"android:background\">@drawable/splash</item>|<item name=\"windowSplashScreenBackground\">$THEME_COLOR</item>|" \
+            $RES/values/styles.xml
+
+          # Location permission for the "My Location" button.
+          sed -i 's|<uses-permission android:name="android.permission.INTERNET" />|&\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />|' \
+            android/app/src/main/AndroidManifest.xml
+
+          # Version: package.json version as the name, run number as the code.
+          VERSION=$(node -p "require('./package.json').version")
+          sed -i "s/versionCode 1$/versionCode $GITHUB_RUN_NUMBER/; s/versionName \"1.0\"/versionName \"$VERSION\"/" \
+            android/app/build.gradle
+
+          npx cap sync android
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          if ! ./gradlew assembleDebug --no-daemon > gradle.log 2>&1; then
+            tail -n 60 gradle.log
+            # Surface the cause as annotations on the run summary.
+            grep -E -A 8 "What went wrong|error:|FAILURE" gradle.log | head -n 40 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+          tail -n 5 gradle.log
+
+      - name: Publish to the android-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk AsaKa.apk
+          NOTES="Android build of commit ${GITHUB_SHA::7}, built $(date -u '+%Y-%m-%d %H:%M UTC').
+
+          Download **AsaKa.apk** below and open it on an Android phone. You may need to allow installing apps from your browser or file manager.
+
+          This is a debug-signed build. If installing over an older copy fails, uninstall the old one first."
+          if gh release view android-latest >/dev/null 2>&1; then
+            gh release upload android-latest AsaKa.apk --clobber
+            gh release edit android-latest --notes "$NOTES"
+          else
+            gh release create android-latest AsaKa.apk \
+              --title "AsaKa Android APK" \
+              --notes "$NOTES" \
+              --target "$GITHUB_SHA"
+          fi
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AsaKa-apk
+          path: AsaKa.apk
